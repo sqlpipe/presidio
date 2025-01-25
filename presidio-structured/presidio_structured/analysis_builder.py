@@ -152,7 +152,7 @@ class TabularAnalysisBuilder(AnalysisBuilder):
 class PandasAnalysisBuilder(TabularAnalysisBuilder):
     """Concrete configuration generator for tabular data."""
 
-    entity_selection_strategies = {"highest_confidence", "mixed", "most_common"}
+    entity_selection_strategies = {"highest_confidence", "custom", "most_common"}
 
     def generate_analysis(
         self,
@@ -160,7 +160,8 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
         n: Optional[int] = None,
         language: str = "en",
         selection_strategy: str = "most_common",
-        mixed_strategy_threshold: float = 0.5,
+        custom_strategy_threshold: float = 0.5,
+        custom_strategy_percentile: float = .5,
     ) -> StructuredAnalysis:
         """
         Generate a configuration from the given tabular data.
@@ -169,9 +170,9 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
         :param n: The number of samples to be taken from the dataframe.
         :param language: The language to be used for analysis.
         :param selection_strategy: A string that specifies the entity selection strategy
-        ('highest_confidence', 'mixed', or default to most common).
-        :param mixed_strategy_threshold: A float value for the threshold to be used in
-        the entity selection mixed strategy.
+        ('highest_confidence', 'custom', or default to most common).
+        :param custom_strategy_threshold: A float value for the threshold to be used in
+        the entity selection custom strategy.
         :return: A StructuredAnalysis object containing the analysis results.
         """
         if not n:
@@ -186,7 +187,7 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
         df = df.sample(n, random_state=123)
 
         key_recognizer_result_map = self._generate_key_rec_results_map(
-            df, language, selection_strategy, mixed_strategy_threshold
+            df, language, selection_strategy, custom_strategy_threshold, custom_strategy_percentile,
         )
 
         key_entity_map = {
@@ -202,7 +203,8 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
         df: DataFrame,
         language: str,
         selection_strategy: str = "most_common",
-        mixed_strategy_threshold: float = 0.5,
+        custom_strategy_threshold: float = 0.5,
+        custom_strategy_percentile: float = .5,
     ) -> Dict[str, RecognizerResult]:
         """
         Find the most common entity in a dataframe column.
@@ -212,16 +214,16 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
         :param df: The dataframe where entities will be searched.
         :param language: Language to be used in the analysis engine.
         :param selection_strategy: A string that specifies the entity selection strategy
-        ('highest_confidence', 'mixed', or default to most common).
-        :param mixed_strategy_threshold: A float value for the threshold to be used in
-        the entity selection mixed strategy.
+        ('highest_confidence', 'custom', or default to most common).
+        :param custom_strategy_threshold: A float value for the threshold to be used in
+        the entity selection custom strategy.
         :return: A dictionary mapping column names to the most common RecognizerResult.
         """
         column_analyzer_results_map = self._batch_analyze_df(df, language)
         key_recognizer_result_map = {}
         for column, analyzer_result in column_analyzer_results_map.items():
             key_recognizer_result_map[column] = self._find_entity_based_on_strategy(
-                analyzer_result, selection_strategy, mixed_strategy_threshold
+                analyzer_result, selection_strategy, custom_strategy_threshold, custom_strategy_percentile, len(df)
             )
         return key_recognizer_result_map
 
@@ -250,7 +252,9 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
         self,
         analyzer_results: List[List[RecognizerResult]],
         selection_strategy: str,
-        mixed_strategy_threshold: float,
+        custom_strategy_threshold: float,
+        custom_strategy_percentile: int,
+        num_rows: int,
     ) -> RecognizerResult:
         """
         Determine the most suitable entity based on the specified selection strategy.
@@ -258,7 +262,7 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
         :param analyzer_results: A nested list of RecognizerResult objects from the
         analysis results.
         :param selection_strategy: A string that specifies the entity selection strategy
-        ('highest_confidence', 'mixed', or default to most common).
+        ('highest_confidence', 'custom', or default to most common).
         :return: A RecognizerResult object representing the selected entity based on the
         given strategy.
         """
@@ -277,9 +281,9 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
         # Select the entity based on the desired strategy
         if selection_strategy == "highest_confidence":
             return self._select_highest_confidence_entity(flat_results)
-        elif selection_strategy == "mixed":
-            return self._select_mixed_strategy_entity(
-                flat_results, mixed_strategy_threshold
+        elif selection_strategy == "custom":
+            return self._select_custom_strategy_entity(
+                flat_results, custom_strategy_threshold, custom_strategy_percentile=custom_strategy_percentile, num_rows=num_rows
             )
 
         return self._select_most_common_entity(flat_results)
@@ -341,33 +345,67 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
             score=highest_score,
         )
 
-    def _select_mixed_strategy_entity(self, flat_results, mixed_strategy_threshold):
+    def _select_custom_strategy_entity(self, flat_results, custom_strategy_threshold, custom_strategy_percentile, num_rows):
         """
-        Select an entity using a mixed strategy.
+        Select an entity using a custom strategy.
 
         Chooses an entity based on the highest confidence score if it is above the
         threshold. Otherwise, it defaults to the most common entity.
 
         :param flat_results: A list of tuples containing index and RecognizerResult
         objects from the flattened analysis results.
-        :return: A RecognizerResult object selected based on the mixed strategy.
+        :return: A RecognizerResult object selected based on the custom strategy.
         """
-        # Check if mixed strategy threshold is within the valid range
-        if not 0 <= mixed_strategy_threshold <= 1:
+        # Check if custom strategy threshold is within the valid range
+        if not 0 <= custom_strategy_threshold <= 1:
             raise ValueError(
-                f"Invalid mixed strategy threshold: {mixed_strategy_threshold}."
+                f"Invalid custom strategy threshold: {custom_strategy_threshold}."
+            )
+        
+        # Check if custom strategy percentile is within the valid range
+        if not 0 <= custom_strategy_percentile <= 1:
+            raise ValueError(
+                f"Invalid custom strategy percentile: {custom_strategy_percentile}."
             )
 
         score_aggregator = self._aggregate_scores(flat_results)
 
-        # Check if the highest score is greater than threshold and select accordingly
-        highest_score = max(
-            max(scores) for scores in score_aggregator.values() if scores
+        # find the number of scores greater than custom_strategy_threshold per entity
+        high_score_counts = {
+            entity: sum(score >= custom_strategy_threshold for score in scores)
+            for entity, scores in score_aggregator.items()
+        }
+
+        # find the entity with the highest number of high scores
+        max_high_score_count = max(high_score_counts.values())
+        highest_score_entities = {
+            entity: high_score_count
+            for entity, high_score_count in high_score_counts.items()
+            if high_score_count == max_high_score_count
+        }
+
+        # if the percent of high scores is below custom_strategy_percentile, return non-pii
+        if max_high_score_count / num_rows <= custom_strategy_percentile:
+            return RecognizerResult(
+                entity_type=NON_PII_ENTITY_TYPE, start=0, end=1, score=1.0
+            )
+        
+        
+        # Get the average score for highest scoring entity by summing, then dividing by the number of rows
+        average_scores = {
+            entity: sum(scores) / num_rows
+            for entity, scores in score_aggregator.items()
+            if entity in highest_score_entities
+        }
+
+        return RecognizerResult(
+            entity_type=max(average_scores, key=average_scores.get),
+            start=0,
+            end=1,
+            score=average_scores[max(average_scores, key=average_scores.get)]
         )
-        if highest_score > mixed_strategy_threshold:
-            return self._select_highest_confidence_entity(flat_results)
-        else:
-            return self._select_most_common_entity(flat_results)
+
+
 
     @staticmethod
     def _aggregate_scores(flat_results):
